@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Query, HTTPException, Request, UploadFile, File
 from starlette.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from typing import Literal, Optional
 import os
@@ -8,6 +9,8 @@ import shutil
 import uuid
 from typing import List
 import hashlib
+from dotenv import load_dotenv
+import os
 
 # For image search
 import chromadb
@@ -17,10 +20,25 @@ from chromadb.errors import NotFoundError
 from transformers import CLIPProcessor, CLIPModel
 import torch
 
+from recommend_unpopular_city import get_recommendations
+from recommend_opole import get_opole_recommendations
+
 
 app = FastAPI()
 
-MODERATION_PASSWORD = "supersecret123"
+# Cors
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+load_dotenv()
+MODERATION_PASSWORD = os.getenv("MODERATION_PASSWORD")
+
+app = FastAPI()
 
 #For viewing the images
 app.mount("/static", StaticFiles(directory="places"), name="static")
@@ -38,169 +56,32 @@ except NotFoundError:
     collection = client.create_collection("images", metadata={"hnsw:space": "cosine"})
 
 
-#### The barebones idea ####
-## In the places folder we ll have the list of places
-## In each different place, we ll have a description, description.txt
-## In info.text, the description should be biased, it will mention if the place
-# has a more cultural impact or more of a historical impact
-
 @app.get("/")
 async def root():
     return FileResponse("index.html")
+
+@app.get("/opole-recommendations")
+async def opole_recommendations():
+    recs = get_opole_recommendations()
+    return {
+        "recommendations": recs
+    }
 
 
 @app.get("/recommendations")
-async def our_recommendation(
-        context: Literal["historical", "cultural"] = Query(..., description="Context"),
+async def recommendations(
+        context: Literal["history", "culture"] = Query(..., description="Context"),
+        place: str = Query(..., description="Place name"),
 ):
-    filename = f"recommendations_{context}.txt"
-    filepath = os.path.join(filename)
-
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"No recommendations found for context '{context}'")
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    return {"recommendations": lines}
-
-
-# @app.get("/text")
-# async def text(
-#         text_query: str,
-# ):
-#     # The model will read the text prompt, then based of the descriptions and feedback_texts,
-#     # it will return a place name
-#
-#
-
-@app.post("/identify")
-async def identify(file: UploadFile = File(...)): # TO RETURN THE PLACE NAME NOT EMBEDDING ID
     try:
-        image_bytes = await file.read()
-        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        recs = get_recommendations(place, context)
+        return {
+            "place": place,
+            "context": context,
+            "recommendations": recs,
+        }
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error opening image: {str(e)}")
-
-    inputs = processor(images=image, return_tensors="pt", padding=True)
-    with torch.no_grad():
-        embeddings = model.get_image_features(**inputs)
-    embedding = embeddings.cpu().numpy()
-
-    result = collection.query(
-        query_embeddings=embedding,
-        n_results=1
-    )
-
-    if not result['ids'] or not result['ids'][0]:
-        raise HTTPException(status_code=404, detail="No matching image found")
-
-    return {
-        "id": result['ids'][0][0],
-        "metadata": result['metadatas'][0][0] if result.get('metadatas') else None,
-        "distance": result['distances'][0][0]
-    }
-
-
-@app.get("/details")
-async def detailed(name: str, request: Request):
-    base_dir = os.path.join("places", name)
-
-    if not os.path.isdir(base_dir):
-        raise HTTPException(status_code=404, detail=f"Place '{name}' not found")
-
-    desc_path = os.path.join(base_dir, "description.txt")
-    description = None
-    if os.path.exists(desc_path):
-        with open(desc_path, "r", encoding="utf-8") as f:
-            description = f.read().strip()
-
-    images_dir = os.path.join(base_dir, "images")
-    images = []
-    if os.path.isdir(images_dir):
-        for file in os.listdir(images_dir):
-            if file.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp")):
-                images.append(str(request.url_for("static", path=f"{name}/images/{file}")))
-
-    return {
-        "name": name,
-        "description": description,
-        "images": images,
-    }
-
-@app.get("/places_list")
-async def places_list():
-    base_dir = "places"
-    if not os.path.isdir(base_dir):
-        raise HTTPException(status_code=404, detail="Places directory not found")
-
-    folders = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name))]
-    return {"places": folders}
-
-
-from fastapi import FastAPI, Query, HTTPException, Request, UploadFile, File
-from starlette.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from typing import Literal
-import os
-from pathlib import Path
-import shutil
-import uuid
-from typing import List
-import hashlib
-
-# For image search
-import chromadb
-from PIL import Image
-from io import BytesIO
-from chromadb.errors import NotFoundError
-from transformers import CLIPProcessor, CLIPModel
-import torch
-
-
-app = FastAPI()
-
-#For viewing the images
-app.mount("/static", StaticFiles(directory="places"), name="static")
-
-### Images vector database
-project_root = Path(__file__).parent
-db_path = project_root / "chroma_db"
-db_path.mkdir(parents=True, exist_ok=True)
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=False)
-model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-client = chromadb.PersistentClient(path=str(db_path))
-try:
-    collection = client.get_collection("images")
-except NotFoundError:
-    collection = client.create_collection("images", metadata={"hnsw:space": "cosine"})
-
-
-#### The barebones idea ####
-## In the places folder we ll have the list of places
-## In each different place, we ll have a description, description.txt
-## In info.text, the description should be biased, it will mention if the place
-# has a more cultural impact or more of a historical impact
-
-@app.get("/")
-async def root():
-    return FileResponse("index.html")
-
-
-@app.get("/recommendation")
-async def our_recommendation(
-        context: Literal["historical", "cultural"] = Query(..., description="Context"),
-):
-    filename = f"recommendations_{context}.txt"
-    filepath = os.path.join(filename)
-
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail=f"No recommendations found for context '{context}'")
-
-    with open(filepath, "r", encoding="utf-8") as f:
-        lines = [line.strip() for line in f if line.strip()]
-
-    return {"recommendations": lines}
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # @app.get("/text")
@@ -291,14 +172,27 @@ async def detailed(name: str, request: Request):
         "feedback_texts": feedback_texts,
     }
 
+
 @app.get("/places_list")
 async def places_list():
     base_dir = "places"
     if not os.path.isdir(base_dir):
         raise HTTPException(status_code=404, detail="Places directory not found")
 
-    folders = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name))]
-    return {"places": folders}
+    result = {}
+    for city in os.listdir(base_dir):
+        city_path = os.path.join(base_dir, city)
+        if os.path.isdir(city_path):
+            subdirs = [
+                name for name in os.listdir(city_path)
+                if os.path.isdir(os.path.join(city_path, name))
+            ]
+            result[city] = {
+                "count": len(subdirs),
+                "places": subdirs
+            }
+
+    return result
 
 @app.post("/post_feedback")
 async def post_feedback(
@@ -312,13 +206,11 @@ async def post_feedback(
     unmod_root = Path("unmoderated_places")
     place_dir = None
 
-    # Search for the place folder in unmoderated_places
     for subdir in unmod_root.rglob("*"):
         if subdir.is_dir() and subdir.name == place:
             place_dir = subdir
             break
 
-    # If not found, copy from places folder
     if not place_dir:
         places_root = Path("places")
         source_place_dir = None
@@ -334,15 +226,12 @@ async def post_feedback(
         if not source_place_dir:
             raise HTTPException(status_code=404, detail=f"Place '{place}' not found in either unmoderated_places or places")
 
-        # Determine the same subdirectory name (country) in unmoderated_places
         country_subdir = unmod_root / source_place_dir.parent.name
         country_subdir.mkdir(parents=True, exist_ok=True)
 
-        # Copy the place folder
         place_dir = country_subdir / place
         shutil.copytree(source_place_dir, place_dir)
 
-    # Create necessary subdirectories
     images_dir = place_dir / "images"
     videos_dir = place_dir / "videos"
     feedback_dir = place_dir / "feedback_texts"
@@ -396,7 +285,6 @@ async def post_feedback(
                 print(f"Skipped {file.filename}: {e}")
                 skipped_files.append(file.filename)
 
-    # Save text feedback if provided
     feedback_file = None
     if text_feedback:
         feedback_file = feedback_dir / f"{place}_{uuid.uuid4().hex}.txt"
@@ -417,7 +305,6 @@ async def post_feedback(
     }
 
 
-
 @app.get("/get_all_unmoderated")
 async def get_all_unmoderated():
     base_root = Path("unmoderated_places")
@@ -426,7 +313,7 @@ async def get_all_unmoderated():
     if not base_root.is_dir():
         return {"places": []}
 
-    for country_dir in base_root.iterdir():  # Skip top-level directories (city name)
+    for country_dir in base_root.iterdir():
         if not country_dir.is_dir():
             continue
 
@@ -458,13 +345,15 @@ async def get_all_unmoderated():
                             "url": str(file)
                         })
 
-            # Collect feedback texts
             feedback_texts = []
             if feedback_dir.is_dir():
                 for file in feedback_dir.iterdir():
                     if file.is_file() and file.suffix.lower() == ".txt":
                         with open(file, "r", encoding="utf-8") as f:
-                            feedback_texts.append(f.read().strip())
+                            feedback_texts.append({
+                                "name_of_feedback": file.name,
+                                "content": f.read().strip()
+                            })
 
             all_places.append({
                 "place": place_name,
@@ -482,17 +371,13 @@ def check_password(password: str):
 
 
 def find_place_dir(base_root: Path, place_name: str) -> Path:
-    for subdir in base_root.rglob("*"):  # recursively searches all subdirectories
+    for subdir in base_root.rglob("*"):
         if subdir.is_dir() and subdir.name == place_name:
             return subdir
     return None
 
 
 def get_moderated_place_dir(unmoderated_place_dir: Path) -> Path:
-    """
-    Build the equivalent moderated path inside 'places/',
-    preserving the parent structure from 'unmoderated_places'.
-    """
     relative_path = unmoderated_place_dir.relative_to("unmoderated_places")
     return Path("places") / relative_path
 
