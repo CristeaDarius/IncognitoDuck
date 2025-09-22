@@ -1,7 +1,6 @@
 #Initial setup:
 python3 -m venv .venv
 Linux: source .venv/bin/activate /// Windows(Visual Studio): .venv\Scripts\activate
-pip install -r requirements.txt
 
 #Start server:
 uvicorn main:app --reload

@@ -11,6 +11,8 @@ from typing import List
 import hashlib
 from dotenv import load_dotenv
 import os
+from fastapi import Form
+import json
 
 # For image search
 import chromadb
@@ -26,6 +28,11 @@ from recommend_opole import get_opole_recommendations
 
 app = FastAPI()
 
+# origins = [
+#     "http://127.0.0.1:5500",
+#     "http://localhost:5500",
+# ]
+
 # Cors
 app.add_middleware(
     CORSMiddleware,
@@ -37,8 +44,6 @@ app.add_middleware(
 
 load_dotenv()
 MODERATION_PASSWORD = os.getenv("MODERATION_PASSWORD")
-
-app = FastAPI()
 
 #For viewing the images
 app.mount("/static", StaticFiles(directory="places"), name="static")
@@ -68,21 +73,44 @@ async def opole_recommendations():
     }
 
 
-@app.get("/recommendations")
-async def recommendations(
+
+TEMP_DIR = "temp_results"
+os.makedirs(TEMP_DIR, exist_ok=True)
+@app.get("/recommendations-generate")
+async def recommendations_generate(
         context: Literal["history", "culture"] = Query(..., description="Context"),
         place: str = Query(..., description="Place name"),
 ):
     try:
         recs = get_recommendations(place, context)
-        return {
-            "place": place,
-            "context": context,
-            "recommendations": recs,
-        }
+
+        temp_filename = f"{uuid.uuid4().hex}.json"
+        temp_path = os.path.join(TEMP_DIR, temp_filename)
+
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "place": place,
+                "context": context,
+                "recommendations": recs,
+            }, f, ensure_ascii=False, indent=2)
+
+        return {"file_id": temp_filename}
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@app.get("/recommendations-result/{file_id}")
+async def recommendations_result(file_id: str):
+    temp_path = os.path.join(TEMP_DIR, file_id)
+
+    if not os.path.isfile(temp_path):
+        raise HTTPException(status_code=404, detail="Result not ready or file not found")
+
+    with open(temp_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data
 
 # @app.get("/text")
 # async def text(
@@ -119,8 +147,16 @@ async def identify(file: UploadFile = File(...)):
     similarity = 1 - distance
     place_name = "_".join(match_id.split("_")[:-1])
 
+    tokens = place_name.split("_")
+    half = len(tokens) // 2
+    if len(tokens) % 2 == 0 and tokens[:half] == tokens[half:]:
+        place_name = "_".join(tokens[:half])
+
     if similarity < 0.75:
-        raise HTTPException(status_code=404, detail=f"No match within threshold. Similarity={similarity:.4f}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"No match within threshold. Similarity={similarity:.4f}"
+        )
 
     return {
         "image_id": match_id,
@@ -196,12 +232,19 @@ async def places_list():
 
 @app.post("/post_feedback")
 async def post_feedback(
-        place: Optional[str] = Query(None),
-        files: Optional[List[UploadFile]] = None,
-        text_feedback: Optional[str] = Query(None)
+        place: str = Form(...),
+        # files: Optional[List[UploadFile]] = None,
+        files: Optional[List[UploadFile]] = File(None),
+        text_feedback: Optional[str] = Form(None)
 ):
     if not place:
-        raise HTTPException(status_code=400, detail="Parameter 'place' is required")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "missing_parameter",
+                "message": "Parameter 'place' is required."
+            }
+        )
 
     unmod_root = Path("unmoderated_places")
     place_dir = None
@@ -224,7 +267,13 @@ async def post_feedback(
                 break
 
         if not source_place_dir:
-            raise HTTPException(status_code=404, detail=f"Place '{place}' not found in either unmoderated_places or places")
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": "place_not_found",
+                    "message": f"Place '{place}' not found in either unmoderated_places or places."
+                }
+            )
 
         country_subdir = unmod_root / source_place_dir.parent.name
         country_subdir.mkdir(parents=True, exist_ok=True)
@@ -235,18 +284,22 @@ async def post_feedback(
     images_dir = place_dir / "images"
     videos_dir = place_dir / "videos"
     feedback_dir = place_dir / "feedback_texts"
-
-    images_dir.mkdir(parents=True, exist_ok=True)
-    videos_dir.mkdir(parents=True, exist_ok=True)
-    feedback_dir.mkdir(parents=True, exist_ok=True)
+    for d in (images_dir, videos_dir, feedback_dir):
+        d.mkdir(parents=True, exist_ok=True)
 
     saved_files = []
-    skipped_files = []
+    file_errors = []
 
     # Handle files if provided
     if files is not None:
-        existing_hashes_images = {hashlib.sha256(f.read_bytes()).hexdigest() for f in images_dir.glob("*") if f.is_file()}
-        existing_hashes_videos = {hashlib.sha256(f.read_bytes()).hexdigest() for f in videos_dir.glob("*") if f.is_file()}
+        existing_hashes_images = {
+            hashlib.sha256(f.read_bytes()).hexdigest()
+            for f in images_dir.glob("*") if f.is_file()
+        }
+        existing_hashes_videos = {
+            hashlib.sha256(f.read_bytes()).hexdigest()
+            for f in videos_dir.glob("*") if f.is_file()
+        }
 
         for file in files:
             content = await file.read()
@@ -254,21 +307,35 @@ async def post_feedback(
             unique_name = f"{place}_{uuid.uuid4().hex}.{ext}"
 
             try:
+                file_hash = hashlib.sha256(content).hexdigest()
+
                 if ext in ["png", "jpg", "jpeg", "gif", "webp"]:
-                    file_hash = hashlib.sha256(content).hexdigest()
                     if file_hash in existing_hashes_images:
-                        skipped_files.append(file.filename)
+                        file_errors.append({
+                            "filename": file.filename,
+                            "reason": "duplicate_image"
+                        })
                         continue
-                    Image.open(BytesIO(content)).verify()
+                    # Verify image validity
+                    try:
+                        Image.open(BytesIO(content)).verify()
+                    except Exception:
+                        file_errors.append({
+                            "filename": file.filename,
+                            "reason": "corrupted_image"
+                        })
+                        continue
                     path = images_dir / unique_name
                     with open(path, "wb") as f_out:
                         f_out.write(content)
                     existing_hashes_images.add(file_hash)
 
                 elif ext in ["mp4", "mov", "avi", "webm"]:
-                    file_hash = hashlib.sha256(content).hexdigest()
                     if file_hash in existing_hashes_videos:
-                        skipped_files.append(file.filename)
+                        file_errors.append({
+                            "filename": file.filename,
+                            "reason": "duplicate_video"
+                        })
                         continue
                     path = videos_dir / unique_name
                     with open(path, "wb") as f_out:
@@ -276,14 +343,21 @@ async def post_feedback(
                     existing_hashes_videos.add(file_hash)
 
                 else:
-                    skipped_files.append(file.filename)
+                    file_errors.append({
+                        "filename": file.filename,
+                        "reason": "unsupported_file_type",
+                        "allowed_types": ["png", "jpg", "jpeg", "gif", "webp", "mp4", "mov", "avi", "webm"]
+                    })
                     continue
 
                 saved_files.append(unique_name)
 
             except Exception as e:
-                print(f"Skipped {file.filename}: {e}")
-                skipped_files.append(file.filename)
+                file_errors.append({
+                    "filename": file.filename,
+                    "reason": "internal_error",
+                    "details": str(e)
+                })
 
     feedback_file = None
     if text_feedback:
@@ -291,16 +365,15 @@ async def post_feedback(
         with open(feedback_file, "w", encoding="utf-8") as f:
             f.write(text_feedback)
 
-    message = f"{len(saved_files)} file(s) uploaded successfully for place '{place}'."
-    if skipped_files:
-        message += f" {len(skipped_files)} file(s) were skipped (duplicate or invalid type)."
-    if feedback_file:
-        message += f" Feedback saved as {feedback_file.name}."
-
     return {
-        "message": message,
-        "files_saved": saved_files,
-        "skipped_files": skipped_files,
+        "place": place,
+        "summary": {
+            "files_saved": len(saved_files),
+            "files_failed": len(file_errors),
+            "feedback_saved": bool(feedback_file)
+        },
+        "saved_files": saved_files,
+        "file_errors": file_errors,
         "feedback_file": feedback_file.name if feedback_file else None
     }
 
@@ -460,7 +533,25 @@ async def moderate_image(
 
     moderated_image_dir = get_moderated_place_dir(place_dir) / "images"
     moderated_image_dir.mkdir(parents=True, exist_ok=True)
+    target_path = moderated_image_dir / image_file_name
+    shutil.move(str(image_file), target_path)
 
-    shutil.move(str(image_file), moderated_image_dir / image_file_name)
+    try:
+        image = Image.open(target_path).convert("RGB")
+        inputs = processor(images=image, return_tensors="pt")
 
-    return {"message": f"Image '{image_file_name}' moved to moderated folder"}
+        with torch.no_grad():
+            embeddings = model.get_image_features(**inputs)
+
+        embeddings = embeddings.cpu().numpy().tolist()
+
+        collection.add(
+            ids=[f"{place}"],
+            embeddings=embeddings,
+            metadatas=[{"place": place, "file_name": image_file_name}],
+            documents=[f"Image of {place}: {image_file_name}"]
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to add image to ChromaDB: {str(e)}")
+
+    return {"message": f"Image '{image_file_name}' moved to moderated folder and added to ChromaDB"}

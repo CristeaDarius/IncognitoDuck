@@ -41,7 +41,6 @@ def get_place_list(city: str):
 
 
 def get_all_places(city: str, max_rounds: int = 5):
-    """Fetch places in multiple rounds until no new ones are found."""
     all_places = []
     seen = set()
 
@@ -49,7 +48,6 @@ def get_all_places(city: str, max_rounds: int = 5):
         print(f"🔎 Fetching round {i+1} ...")
         response = get_place_list(city)
 
-        # handle either {"places": [...]} or just a list
         places = response.get("places", response)
 
         new_places = [p for p in places if p not in seen]
@@ -128,7 +126,6 @@ def get_all_opole_places():
 if __name__ == "__main__":
     city = "Opole"
 
-    # Just get the complete place list (multi-round fetch)
     places = get_all_places(city)
 
     print("\n✅ Full place list fetched successfully!")
